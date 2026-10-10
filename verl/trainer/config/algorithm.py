@@ -1,0 +1,809 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from verl.base_config import BaseConfig
+
+__all__ = [
+    "AdaptiveTopupConfig",
+    "AlgoConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "RolloutCorrectionConfig",
+    "SparseCounterfactualCreditConfig",
+    "StepSplitConfig",
+]
+
+
+@dataclass
+class KLControlConfig(BaseConfig):
+    """Configuration for KL control.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        type (str): Type of KL control. Can be "fixed" or "adaptive".
+        kl_coef (float): Initial coefficient for KL penalty.
+        horizon (int): Horizon value for adaptive controller.
+        target_kl (float): Target KL divergence for adaptive controller.
+    """
+
+    type: str = "fixed"
+    kl_coef: float = 0.001
+    horizon: int = 10000
+    target_kl: float = 0.1
+
+
+@dataclass
+class AdaptiveTopupConfig(BaseConfig):
+    """Adaptive extra rollouts for homogeneous dynamic-sampling groups.
+
+    Only prompt groups whose initial samples have zero metric variance are
+    extended.  Extra samples are discarded after a fixed-size mixed group is
+    reconstructed for training.
+    """
+
+    enabled: bool = False
+    max_total_n: int = 0
+    chunk_size: int = 4
+    selection_seed: int = 42
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ValueError("filter_groups.adaptive_topup.enabled must be a bool.")
+        if not isinstance(self.max_total_n, int) or isinstance(self.max_total_n, bool) or self.max_total_n < 0:
+            raise ValueError("filter_groups.adaptive_topup.max_total_n must be an integer >= 0.")
+        if not isinstance(self.chunk_size, int) or isinstance(self.chunk_size, bool) or self.chunk_size < 1:
+            raise ValueError("filter_groups.adaptive_topup.chunk_size must be an integer >= 1.")
+        if not isinstance(self.selection_seed, int) or isinstance(self.selection_seed, bool):
+            raise ValueError("filter_groups.adaptive_topup.selection_seed must be an integer.")
+        if self.enabled and self.max_total_n < 2:
+            raise ValueError("filter_groups.adaptive_topup.max_total_n must be >= 2 when enabled.")
+
+
+@dataclass
+class FilterGroupsConfig(BaseConfig):
+    """Configuration for filter groups (used in DAPO and Entropy).
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        enable (bool): Whether to enable filter groups.
+        metric (Optional[str]): Metric to use for filtering: "acc", "score", "seq_reward", "seq_final_reward", etc.
+        max_num_gen_batches (int): Non-positive values mean no upper limit.
+        fill_shortfall (bool): Fill a short batch with filtered-out prompt groups instead of generating another batch.
+        adaptive_topup (AdaptiveTopupConfig): Extra sampling for initially homogeneous groups.
+    """
+
+    enable: bool = False
+    metric: Optional[str] = None
+    max_num_gen_batches: int = 0
+    fill_shortfall: bool = False
+    adaptive_topup: AdaptiveTopupConfig = field(default_factory=AdaptiveTopupConfig)
+
+
+@dataclass
+class StepSplitConfig(BaseConfig):
+    """Configuration for tokenizer-aligned reasoning-step boundaries.
+
+    Step splitting is a reusable batch annotation and does not imply that a
+    value probe, a particular advantage estimator, or hidden-state extraction
+    is enabled.
+
+    Args:
+        enabled (bool): Attach ``step_end_mask`` to rollout batches.
+        min_step_tokens (int): Ordinary fragments shorter than this are merged.
+        max_step_tokens (int): Longer fragments are split at a safe text boundary.
+    """
+
+    enabled: bool = False
+    min_step_tokens: int = 96
+    max_step_tokens: int = 512
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ValueError(f"step_split.enabled must be a bool, got {self.enabled!r}.")
+        if (
+            not isinstance(self.min_step_tokens, int)
+            or isinstance(self.min_step_tokens, bool)
+            or self.min_step_tokens < 1
+        ):
+            raise ValueError(f"step_split.min_step_tokens must be an integer >= 1, got {self.min_step_tokens!r}.")
+        if (
+            not isinstance(self.max_step_tokens, int)
+            or isinstance(self.max_step_tokens, bool)
+            or self.max_step_tokens < self.min_step_tokens
+        ):
+            raise ValueError(
+                "step_split.max_step_tokens must be an integer >= min_step_tokens "
+                f"({self.min_step_tokens}), got {self.max_step_tokens!r}."
+            )
+
+
+@dataclass
+class SparseCounterfactualCreditConfig(BaseConfig):
+    """Sparse Monte-Carlo supervision for step-level policy credit.
+
+    Entropy is used only to choose a small number of step anchors. Each
+    selected anchor receives Q/V value targets from fresh suffix rollouts; a
+    detached actor-side value head predicts unobserved boundaries and adjacent
+    value differences provide step credit. With use_probe=False, unobserved
+    step credits are zero before the same per-response centering and batch RMS scaling.
+    """
+
+    enabled: bool = False
+    use_probe: bool = True
+    entropy_top_ratio: float = 0.2
+    anchors_per_group: int = 2
+    sampling_temperature: float = 1.0
+    uniform_mix: float = 0.1
+    num_samples: int = 4
+    train_mc_branches: bool = False
+    branch_groups_per_prompt: int = 2
+    correctness_key: str = "acc"
+    mc_value_loss_weight: float = 0.6
+    start_value_loss_weight: float = 0.2
+    terminal_value_loss_weight: float = 0.2
+    advantage_coef: float = 0.3
+    warmup_ratio: float = 0.1
+    epsilon: float = 1e-6
+    selection_seed: int = 42
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = -1
+    repetition_penalty: float = 1.0
+    max_new_tokens: Optional[int] = None
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ValueError("sparse_counterfactual_credit.enabled must be a bool.")
+        if not isinstance(self.use_probe, bool):
+            raise ValueError("sparse_counterfactual_credit.use_probe must be a bool.")
+        self._validate_open_unit("entropy_top_ratio", self.entropy_top_ratio)
+        if (
+            not isinstance(self.anchors_per_group, int)
+            or isinstance(self.anchors_per_group, bool)
+            or self.anchors_per_group < 1
+        ):
+            raise ValueError("sparse_counterfactual_credit.anchors_per_group must be an integer >= 1.")
+        self._validate_positive("sampling_temperature", self.sampling_temperature)
+        self._validate_closed_unit("uniform_mix", self.uniform_mix)
+        if not isinstance(self.num_samples, int) or isinstance(self.num_samples, bool) or self.num_samples < 1:
+            raise ValueError("sparse_counterfactual_credit.num_samples must be an integer >= 1.")
+        if not isinstance(self.train_mc_branches, bool):
+            raise ValueError("sparse_counterfactual_credit.train_mc_branches must be a bool.")
+        if (
+            not isinstance(self.branch_groups_per_prompt, int)
+            or isinstance(self.branch_groups_per_prompt, bool)
+            or self.branch_groups_per_prompt < 1
+        ):
+            raise ValueError("sparse_counterfactual_credit.branch_groups_per_prompt must be an integer >= 1.")
+        if not isinstance(self.correctness_key, str) or not self.correctness_key.strip():
+            raise ValueError("sparse_counterfactual_credit.correctness_key must be a non-empty string.")
+        for name in ("mc_value_loss_weight", "start_value_loss_weight", "terminal_value_loss_weight"):
+            self._validate_closed_unit(name, getattr(self, name))
+        if self.mc_value_loss_weight + self.start_value_loss_weight + self.terminal_value_loss_weight <= 0:
+            raise ValueError("sparse_counterfactual_credit value-loss weights may not all be zero.")
+        self._validate_closed_unit("advantage_coef", self.advantage_coef)
+        self._validate_closed_unit("warmup_ratio", self.warmup_ratio)
+        self._validate_positive("epsilon", self.epsilon)
+        if not isinstance(self.selection_seed, int) or isinstance(self.selection_seed, bool):
+            raise ValueError("sparse_counterfactual_credit.selection_seed must be an integer.")
+        self._validate_positive("temperature", self.temperature)
+        self._validate_open_unit("top_p", self.top_p)
+        if not isinstance(self.top_k, int) or isinstance(self.top_k, bool) or self.top_k == 0 or self.top_k < -1:
+            raise ValueError("sparse_counterfactual_credit.top_k must be -1 or an integer >= 1.")
+        self._validate_positive("repetition_penalty", self.repetition_penalty)
+        if self.max_new_tokens is not None and (
+            not isinstance(self.max_new_tokens, int) or isinstance(self.max_new_tokens, bool) or self.max_new_tokens < 1
+        ):
+            raise ValueError("sparse_counterfactual_credit.max_new_tokens must be null or an integer >= 1.")
+
+    @staticmethod
+    def _validate_positive(name: str, value: float) -> None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"sparse_counterfactual_credit.{name} must be finite and > 0.")
+
+    @staticmethod
+    def _validate_closed_unit(name: str, value: float) -> None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0.0 <= value <= 1.0
+        ):
+            raise ValueError(f"sparse_counterfactual_credit.{name} must be finite and in [0, 1].")
+
+    @staticmethod
+    def _validate_open_unit(name: str, value: float) -> None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0.0 < value <= 1.0
+        ):
+            raise ValueError(f"sparse_counterfactual_credit.{name} must be finite and in (0, 1].")
+
+
+@dataclass
+class RolloutCorrectionConfig(BaseConfig):
+    """Configuration for Rollout Correction (addresses off-policy issues in RL training).
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Rollout Correction handles off-policiness from multiple sources:
+    1. Policy mismatch: Rollout policy (e.g., vLLM BF16) vs Training policy (e.g., FSDP FP32)
+    2. Model update staleness: Rollout data collected from older policy checkpoints
+    3. General off-policy scenarios: Any distribution shift between data collection and training
+
+    For more details, see:
+    "When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch"
+    https://richardli.xyz/rl-collapse
+
+    This typed config replaces the old dict-based approach and provides:
+    - Type safety and validation
+    - Clear documentation of all parameters
+    - Named factory methods for common presets (TIS, MIS, etc.)
+    - Sensible defaults
+
+    Args:
+        rollout_is (Optional[str]): IS weight aggregation level.
+            - None: No IS weights (metrics only)
+            - "token": Per-token IS weights (low variance, biased)
+            - "sequence": Per-sequence IS weights (unbiased, high variance)
+            Default: "sequence"
+
+        rollout_is_threshold (float): Upper threshold for IS weight truncation/rejection.
+            Typical range: 1.5-5.0 for token level, 2.0-10.0 for sequence level.
+            Default: 2.0
+
+        rollout_is_batch_normalize (bool): Apply batch normalization to IS weights.
+            - True: Normalize IS weights to have mean=1.0 within each batch
+            - False: Use raw (truncated) IS weights (standard)
+            - Reduces variance by ensuring average weight is 1.0 per batch
+            - Only affects IS weight values, not rejection sampling
+            Default: False (no batch normalization)
+
+        rollout_rs (Optional[str]): Rejection sampling aggregation modes.
+            Accepts a comma-delimited list (duplicates removed) of canonical options implemented in
+            ``rollout_corr_helper``:
+            - "token_k1": Token-level rejection with ``-log r`` (ratio thresholds supplied via
+              ``rollout_rs_threshold`` as ``lower_upper``)
+            - "token_k2": Token-level rejection with ``0.5 * (log r)^2`` (upper bound only)
+            - "token_k3": Token-level rejection with ``exp(log r) - 1 - log r`` (upper bound only)
+            - "seq_sum_k1": Sequence sum of ``-log r`` (ratio bounds)
+            - "seq_sum_k2": Sequence sum of rejection with ``0.5 * (log r)^2`` (upper bound only)
+            - "seq_sum_k3": Sequence sum of rejection with ``exp(log r) - 1 - log r`` (upper bound only)
+            - "seq_mean_k1": Sequence mean of ``-log r`` (ratio bounds)
+            - "seq_mean_k2": Sequence mean of rejection with ``0.5 * (log r)^2`` (upper bound only)
+            - "seq_mean_k3": Sequence mean of rejection with ``exp(log r) - 1 - log r`` (upper bound only)
+            - "seq_max_k2": Sequence max of rejection with ``0.5 * (log r)^2`` (upper bound only)
+            - "seq_max_k3": Sequence max of rejection with ``exp(log r) - 1 - log r`` (upper bound only)
+            names automatically. Default: None
+
+        rollout_rs_threshold (Optional[Union[str, float]]): Threshold specification for rejection sampling.
+            Provide one value per option (single entry is broadcast when multiple options are supplied).
+            Ratio-based modes (``*k1``) expect ``lower_upper`` strings; supplying a single float implies
+            only the upper ratio bound, with the lower bound inferred as its reciprocal. Divergence modes
+            (k2/k3) expect positive upper bounds (float or string). Default: None
+
+        bypass_mode (bool): Operating mode - bypass or decoupled.
+            - True: Bypass mode - reuse rollout_log_prob as old_log_prob (2 policies)
+              Uses compute_policy_loss_bypass_mode() with loss_type selection
+            - False: Decoupled mode - compute old_log_prob separately (3 policies)
+              Uses standard PPO loss with IS weight correction
+            Default: False (decoupled mode)
+
+        loss_type (str): Loss function type in bypass mode (bypass_mode=True).
+            - "reinforce": REINFORCE-style policy gradient with explicit IS weights
+              L = -E[w * log π(a|s) * A] where w = π_current / π_rollout
+            - "ppo_clip": PPO clipped objective (IS handled by ratio, no explicit weights)
+              L = -E[min(r*A, clip(r)*A)] where r = π_current / π_rollout
+            Default: "ppo_clip"
+
+    Example:
+        # Create with defaults
+        config = RolloutCorrectionConfig()
+
+        # Decoupled PPO mode presets (3 policies: π_rollout, π_old, π_θ)
+        # IS weights correct for gap between π_old and π_rollout
+        config = RolloutCorrectionConfig.decoupled_token_is()  # Token-TIS
+        config = RolloutCorrectionConfig.decoupled_seq_is()    # Seq-TIS
+        config = RolloutCorrectionConfig.decoupled_seq_is_rs() # Seq-MIS
+        config = RolloutCorrectionConfig.decoupled_geo_rs()    # Geo-RS (ratio mode)
+
+        # Bypass mode presets (2 policies: π_rollout = π_old, π_θ)
+        # loss_type controls the loss function
+        # PPO-clip presets (ratio handles IS, so no separate IS weights needed):
+        config = RolloutCorrectionConfig.bypass_ppo_clip()              # PPO-clip only
+        config = RolloutCorrectionConfig.bypass_ppo_clip_geo_rs()       # PPO-clip + Geo-RS
+        config = RolloutCorrectionConfig.bypass_ppo_clip_k3_rs()        # PPO-clip + K3-RS
+        # REINFORCE presets (explicit IS weights):
+        config = RolloutCorrectionConfig.bypass_pg_is()                 # REINFORCE + Seq-TIS
+        config = RolloutCorrectionConfig.bypass_pg_geo_rs()             # REINFORCE + Geo-RS
+        config = RolloutCorrectionConfig.bypass_pg_geo_rs_seq_tis()     # REINFORCE + Geo-RS + Seq-TIS
+        config = RolloutCorrectionConfig.bypass_pg_geo_rs_token_tis()   # REINFORCE + Geo-RS + Token-TIS
+
+        # Decoupled Geometric ratio presets (length-normalized IS ratio)
+        config = RolloutCorrectionConfig.decoupled_geo_rs_seq_tis()           # Decoupled Geo-RS + Seq-TIS
+        config = RolloutCorrectionConfig.decoupled_geo_rs_token_tis()         # Decoupled Geo-RS + Token-TIS
+
+        # Decoupled K3 KL Estimator presets (more stable for small KL values)
+        config = RolloutCorrectionConfig.decoupled_k3_rs()                    # Decoupled K3-RS
+        config = RolloutCorrectionConfig.decoupled_k3_rs_seq_tis()            # Decoupled K3-RS + Seq-TIS
+        config = RolloutCorrectionConfig.decoupled_k3_rs_token_tis()          # Decoupled K3-RS + Token-TIS
+
+    Reference:
+        Liu, Li, Fu, Wang, Liu, Shen (2025)
+        "When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch"
+        https://richardli.xyz/rl-collapse
+    """
+
+    rollout_is: Optional[str] = "sequence"
+    rollout_is_threshold: float = 2.0
+    rollout_is_batch_normalize: bool = False
+    rollout_rs: Optional[str] = None
+    rollout_rs_threshold: Optional[str | float] = None
+    bypass_mode: bool = False
+    loss_type: str = "ppo_clip"
+
+    @classmethod
+    def decoupled_token_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
+        """Decoupled Mode with Token-level Importance Sampling.
+
+        IS weight correction at token level in decoupled mode (three policies).
+
+        Args:
+            threshold (float): Upper threshold for IS weights. Default: 2.0
+
+        Returns:
+            RolloutCorrectionConfig configured for decoupled mode with token-level IS
+        """
+        return cls(rollout_is="token", rollout_is_threshold=threshold, rollout_rs=None)
+
+    @classmethod
+    def decoupled_seq_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
+        """Decoupled Mode with Sequence-level Importance Sampling.
+
+        IS weight correction at sequence level in decoupled mode (three policies).
+
+        Args:
+            threshold (float): Upper threshold for IS weights. Default: 2.0
+
+        Returns:
+            RolloutCorrectionConfig configured for decoupled mode with sequence-level IS
+        """
+        return cls(rollout_is="sequence", rollout_is_threshold=threshold, rollout_rs=None)
+
+    @classmethod
+    def decoupled_seq_is_rs(
+        cls,
+        is_threshold: float = 2.0,
+        rs_threshold: Optional[str | float] = "0.5_2.0",
+    ) -> "RolloutCorrectionConfig":
+        """Decoupled Mode with Sequence-level IS + Rejection Sampling.
+
+        Sequence-level IS with sequence-level rejection sampling in decoupled mode.
+        Rejects entire sequences based on sequence-level IS weight.
+
+        Args:
+            is_threshold (float): Upper threshold for IS weights. Default: 2.0
+            rs_threshold (Optional[Union[str, float]]): Upper threshold for rejection sampling. Default: 0.5_2.0
+
+        Returns:
+            RolloutCorrectionConfig configured for decoupled mode with sequence IS + RS
+        """
+        return cls(
+            rollout_is="sequence",
+            rollout_is_threshold=is_threshold,
+            rollout_rs="seq_sum_k1",
+            rollout_rs_threshold=rs_threshold,
+        )
+
+    @classmethod
+    def decoupled_geo_rs(
+        cls,
+        rs_threshold: Optional[str | float] = "0.999_1.001",
+    ) -> "RolloutCorrectionConfig":
+        """Decoupled Mode with Geometric Mean Rejection Sampling (ratio-based).
+
+        Uses geometric mean IS ratio E[log(r)] for rejection sampling at sequence level.
+        This is a ratio-based mode (ideal = 0.0) with [lower, upper] threshold bounds.
+        Length-normalized but still uses IS ratio semantics.
+
+        Args:
+            rs_threshold (Optional[Union[str, float]]): Geometric RS threshold (upper). Default: 0.999_1.001 (±0.1%)
+
+        Returns:
+            RolloutCorrectionConfig configured for decoupled mode with Geo-RS
+        """
+        return cls(
+            rollout_is=None,
+            rollout_rs="seq_mean_k1",
+            rollout_rs_threshold=rs_threshold,
+        )
+
+    @classmethod
+    def bypass_ppo_clip(cls) -> "RolloutCorrectionConfig":
+        """Bypass mode with PPO-clip loss.
+
+        PPO clipped objective in bypass mode. The PPO ratio = π_θ/π_rollout
+        already handles IS correction, so no explicit IS weights are applied.
+
+        Skips old_log_prob computation for faster execution (2 policies instead of 3).
+
+        Returns:
+            RolloutCorrectionConfig configured for bypass mode with PPO-clip
+        """
+        return cls(
+            rollout_is=None,
+            rollout_rs=None,
+            bypass_mode=True,
+            loss_type="ppo_clip",
+        )
+
+    @classmethod
+    def bypass_ppo_clip_geo_rs(
+        cls,
+        rs_threshold: Optional[str | float] = "0.999_1.001",
+    ) -> "RolloutCorrectionConfig":
+        """Bypass mode with PPO-clip loss and Geometric Mean RS (ratio-based).
+
+        PPO clipped objective in bypass mode with geometric mean IS ratio RS.
+        Uses E[log(r)] (ideal = 0.0) with [lower, upper] threshold bounds.
+
+        Args:
+            rs_threshold (Optional[Union[str, float]]): Geometric RS threshold (upper). Default: 0.999_1.001 (±0.1%)
+
+        Returns:
+            RolloutCorrectionConfig configured for bypass mode with PPO-clip + Geo-RS
+        """
+        return cls(
+            rollout_is=None,
+            rollout_rs="seq_mean_k1",
+            rollout_rs_threshold=rs_threshold,
+            bypass_mode=True,
+            loss_type="ppo_clip",
+        )
+
+    @classmethod
+    def bypass_ppo_clip_k3_rs(
+        cls,
+        rs_threshold: float = 0.01,
+    ) -> "RolloutCorrectionConfig":
+        """Bypass mode with PPO-clip loss and K3 Rejection Sampling.
+
+        PPO clipped objective in bypass mode with K3 KL estimator RS to mask outliers.
+        K3 is more stable than K1 for small KL values.
+        The PPO ratio = π_θ/π_rollout already handles IS correction.
+
+        Args:
+            rs_threshold (float): Max allowed K3 divergence. Default: 0.01
+
+        Returns:
+            RolloutCorrectionConfig configured for bypass mode with PPO-clip + K3-RS
+        """
+        return cls(
+            rollout_is=None,
+            rollout_rs="seq_mean_k3",
+            rollout_rs_threshold=rs_threshold,
+            bypass_mode=True,
+            loss_type="ppo_clip",
+        )
+
+    @classmethod
+    def bypass_pg_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
+        """Bypass mode with REINFORCE loss and IS Correction.
+
+        Uses REINFORCE loss with explicit IS correction in bypass mode.
+        No PPO clipping.
+
+        Args:
+            threshold (float): Upper threshold for IS weights. Default: 2.0
+
+        Returns:
+            RolloutCorrectionConfig configured for bypass mode with REINFORCE + IS
+        """
+        return cls(
+            rollout_is="sequence",
+            rollout_is_threshold=threshold,
+            rollout_rs=None,
+            bypass_mode=True,
+            loss_type="reinforce",
+        )
+
+    @classmethod
+    def bypass_pg_geo_rs(
+        cls,
+        rs_threshold: Optional[str | float] = "0.999_1.001",
+    ) -> "RolloutCorrectionConfig":
+        """Bypass mode with REINFORCE loss and Geometric Mean RS (ratio-based).
+
+        REINFORCE with geometric mean IS ratio rejection sampling in bypass mode.
+        Uses E[log(r)] (ideal = 0.0) with [lower, upper] threshold bounds.
+
+        Args:
+            rs_threshold (Optional[Union[str, float]]): Geometric RS threshold (upper). Default: 0.999_1.001 (±0.1%)
+
+        Returns:
+            RolloutCorrectionConfig configured for bypass mode with REINFORCE + Geo-RS
+        """
+        return cls(
+            rollout_is=None,
+            rollout_rs="seq_mean_k1",
+            rollout_rs_threshold=rs_threshold,
+            bypass_mode=True,
+            loss_type="reinforce",
+        )
+
+    @classmethod
+    def decoupled_geo_rs_seq_tis(
+        cls,
+        is_threshold: float = 2.0,
+        rs_threshold: Optional[str | float] = "0.999_1.001",
+    ) -> "RolloutCorrectionConfig":
+        """Decoupled mode with Geometric Mean RS and Sequence-level Truncated IS (ratio-based).
+
+        Combines the Geometric Mean Filter (ratio-based validity check) with
+        Clipped Sequence Weight (debiasing). Uses E[log(r)] (ideal = 0.0).
+
+        Args:
+            is_threshold (float): Upper threshold for sequence IS weights. Default: 2.0
+            rs_threshold (Optional[Union[str, float]]): Geometric RS threshold (upper). Default: 0.999_1.001 (±0.1%)
+
+        Returns:
+            RolloutCorrectionConfig configured for Geo-RS-Seq-TIS
+        """
+        return cls(
+            rollout_is="sequence",
+            rollout_is_threshold=is_threshold,
+            rollout_rs="seq_mean_k1",
+            rollout_rs_threshold=rs_threshold,
+        )
+
+    @classmethod
+    def decoupled_geo_rs_token_tis(
+        cls,
+        is_threshold: float = 2.0,
+        rs_threshold: Optional[str | float] = "0.999_1.001",
+    ) -> "RolloutCorrectionConfig":
+        """Decoupled mode with Geometric Mean RS and Token-level Truncated IS (ratio-based).
+
+        Combines the Geometric Mean Filter (ratio-based validity check) with
+        Token-level IS weights. Uses E[log(r)] (ideal = 0.0).
+
+        Args:
+            is_threshold (float): Upper threshold for token IS weights. Default: 2.0
+            rs_threshold (Optional[Union[str, float]]): Geometric RS threshold (upper). Default: 0.999_1.001 (±0.1%)
+
+        Returns:
+            RolloutCorrectionConfig configured for Geo-RS-Token-TIS
+        """
+        return cls(
+            rollout_is="token",
+            rollout_is_threshold=is_threshold,
+            rollout_rs="seq_mean_k1",
+            rollout_rs_threshold=rs_threshold,
+        )
+
+    @classmethod
+    def bypass_pg_geo_rs_seq_tis(
+        cls,
+        is_threshold: float = 2.0,
+        rs_threshold: Optional[str | float] = "0.999_1.001",
+    ) -> "RolloutCorrectionConfig":
+        """Bypass mode with REINFORCE loss, Geo-RS, and Sequence-level IS.
+
+        Combines geometric mean IS ratio rejection with sequence-level IS
+        in bypass mode with REINFORCE loss (no PPO clipping).
+        Uses E[log(r)] (ideal = 0.0) with [lower, upper] threshold bounds.
+
+        Args:
+            is_threshold (float): Upper threshold for sequence IS weights. Default: 2.0
+            rs_threshold (Optional[Union[str, float]]): Geometric RS threshold (upper). Default: 0.999_1.001 (±0.1%)
+
+        Returns:
+            RolloutCorrectionConfig configured for bypass mode with REINFORCE + Geo-RS + Seq-TIS
+        """
+        return cls(
+            rollout_is="sequence",
+            rollout_is_threshold=is_threshold,
+            rollout_rs="seq_mean_k1",
+            rollout_rs_threshold=rs_threshold,
+            bypass_mode=True,
+            loss_type="reinforce",
+        )
+
+    @classmethod
+    def bypass_pg_geo_rs_token_tis(
+        cls,
+        is_threshold: float = 2.0,
+        rs_threshold: Optional[str | float] = "0.999_1.001",
+    ) -> "RolloutCorrectionConfig":
+        """Bypass mode with REINFORCE loss, Geo-RS, and Token-level IS.
+
+        Combines geometric mean IS ratio rejection with token-level IS weights
+        in bypass mode with REINFORCE loss (no PPO clipping).
+        Uses E[log(r)] (ideal = 0.0) with [lower, upper] threshold bounds.
+
+        Token-level IS has lower variance but introduces bias.
+
+        Args:
+            is_threshold (float): Upper threshold for token IS weights. Default: 2.0
+            rs_threshold (Optional[Union[str, float]]): Geometric RS threshold (upper). Default: 0.999_1.001 (±0.1%)
+
+        Returns:
+            RolloutCorrectionConfig configured for bypass mode with REINFORCE + Geo-RS + Token-TIS
+        """
+        return cls(
+            rollout_is="token",
+            rollout_is_threshold=is_threshold,
+            rollout_rs="seq_mean_k1",
+            rollout_rs_threshold=rs_threshold,
+            bypass_mode=True,
+            loss_type="reinforce",
+        )
+
+    @classmethod
+    def decoupled_k3_rs(
+        cls,
+        rs_threshold: float = 0.01,
+    ) -> "RolloutCorrectionConfig":
+        """Decoupled mode with K3 KL Estimator Rejection Sampling.
+
+        Uses K3 KL estimator at sequence level for rejection sampling.
+        K3 = E[r - log(r) - 1] where r = π_train/π_rollout.
+        More stable than geometric mean for small KL values.
+
+        K3 >= 0 always (equals 0 when policies match exactly).
+
+        Args:
+            rs_threshold (float): Max allowed K3 divergence. Default: 0.01
+                Typical range: 0.001-0.1
+
+        Returns:
+            RolloutCorrectionConfig configured for K3 RS
+        """
+        return cls(
+            rollout_is=None,
+            rollout_rs="seq_mean_k3",
+            rollout_rs_threshold=rs_threshold,
+        )
+
+    @classmethod
+    def decoupled_k3_rs_seq_tis(
+        cls,
+        is_threshold: float = 2.0,
+        rs_threshold: float = 0.01,
+    ) -> "RolloutCorrectionConfig":
+        """Decoupled mode with K3 RS and Sequence-level Truncated IS.
+
+        Combines K3 KL estimator rejection with sequence-level IS weights.
+        K3 provides more stable outlier detection than geometric mean.
+
+        Args:
+            is_threshold (float): Upper threshold for sequence IS weights. Default: 2.0
+            rs_threshold (float): Max allowed K3 divergence. Default: 0.01
+
+        Returns:
+            RolloutCorrectionConfig configured for K3-RS-Seq-TIS
+        """
+        return cls(
+            rollout_is="sequence",
+            rollout_is_threshold=is_threshold,
+            rollout_rs="seq_mean_k3",
+            rollout_rs_threshold=rs_threshold,
+        )
+
+    @classmethod
+    def decoupled_k3_rs_token_tis(
+        cls,
+        is_threshold: float = 2.0,
+        rs_threshold: float = 0.01,
+    ) -> "RolloutCorrectionConfig":
+        """Decoupled mode with K3 RS and Token-level Truncated IS.
+
+        Combines K3 KL estimator rejection with token-level IS weights.
+        K3 provides more stable outlier detection than geometric mean.
+        Token-level IS has lower variance but introduces bias.
+
+        Args:
+            is_threshold (float): Upper threshold for token IS weights. Default: 2.0
+            rs_threshold (float): Max allowed K3 divergence. Default: 0.01
+
+        Returns:
+            RolloutCorrectionConfig configured for K3-RS-Token-TIS
+        """
+        return cls(
+            rollout_is="token",
+            rollout_is_threshold=is_threshold,
+            rollout_rs="seq_mean_k3",
+            rollout_rs_threshold=rs_threshold,
+        )
+
+    @classmethod
+    def disabled(cls) -> "RolloutCorrectionConfig":
+        """Disabled - Metrics Only Mode.
+
+        Computes and logs off-policy metrics without applying correction.
+
+        Returns:
+            RolloutCorrectionConfig with all correction disabled
+        """
+        return cls(rollout_is=None, rollout_rs=None)
+
+
+@dataclass
+class AlgoConfig(BaseConfig):
+    """Configuration for the algorithm.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        gamma (float): Discount factor for future rewards.
+        lam (float): Trade-off between bias and variance in the GAE estimator.
+        adv_estimator (str): Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
+        norm_adv_by_std_in_grpo (bool): Whether to normalize advantages by std (specific to GRPO).
+        step_split (StepSplitConfig): Reusable reasoning-step boundary configuration.
+        sparse_counterfactual_credit (SparseCounterfactualCreditConfig): Sparse step-credit supervision.
+        use_kl_in_reward (bool): Whether to enable in-reward KL penalty.
+        kl_penalty (str): How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full".
+        kl_ctrl (KLControlConfig): KL control configuration.
+        use_pf_ppo (bool): Whether to enable preference feedback PPO.
+        pf_ppo (dict[str, Any]): Preference feedback PPO settings.
+        filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
+        rollout_correction (Optional[RolloutCorrectionConfig]): Rollout Correction configuration.
+            Addresses off-policy issues from policy mismatch, model staleness, and general distribution shifts.
+
+            Set to None to disable entirely. Use factory methods for common presets:
+            - RolloutCorrectionConfig.decoupled_token_is() - Decoupled mode with token-level IS
+            - RolloutCorrectionConfig.decoupled_seq_is() - Decoupled mode with sequence-level IS
+            - RolloutCorrectionConfig.decoupled_seq_is_rs() - Decoupled mode with sequence IS + RS
+            - RolloutCorrectionConfig.decoupled_k1_rs() - Decoupled mode with K1-RS (divergence)
+            - RolloutCorrectionConfig.decoupled_geo_rs() - Decoupled mode with Geo-RS (ratio)
+            - RolloutCorrectionConfig.bypass_ppo_clip() - Bypass mode with PPO-clip
+            - RolloutCorrectionConfig.bypass_ppo_clip_k1_rs() - Bypass mode with PPO-clip + K1-RS
+            - RolloutCorrectionConfig.bypass_pg_is() - Bypass mode with REINFORCE + IS
+            - RolloutCorrectionConfig.bypass_pg_k1_rs() - Bypass mode with REINFORCE + K1-RS
+
+            For backward compatibility, you can still pass a dict, which will be converted to
+            RolloutCorrectionConfig automatically.
+    """
+
+    gamma: float = 1.0
+    lam: float = 1.0
+    adv_estimator: str = "gae"
+    norm_adv_by_std_in_grpo: bool = True
+    step_split: StepSplitConfig = field(default_factory=StepSplitConfig)
+    sparse_counterfactual_credit: SparseCounterfactualCreditConfig = field(
+        default_factory=SparseCounterfactualCreditConfig
+    )
+    use_kl_in_reward: bool = False
+    kl_penalty: str = "kl"
+    kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)
+    use_pf_ppo: bool = False
+    pf_ppo: dict[str, Any] = field(default_factory=dict)
+    filter_groups: Optional[FilterGroupsConfig] = None
+    # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
+    # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
+    rollout_correction: Optional[RolloutCorrectionConfig] = None
+    # GDPO (Group reward-Decoupled Normalization Policy Optimization) settings.
+    # gdpo_reward_keys: keys in non_tensor_batch (from compute_score's return dict) that
+    #   correspond to individual reward dimensions, e.g. ["format_reward", "accuracy_reward"].
+    # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
+    gdpo_reward_keys: Optional[list[str]] = None
+    gdpo_reward_weights: Optional[list[float]] = None
